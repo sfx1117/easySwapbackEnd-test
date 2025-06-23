@@ -4,7 +4,7 @@ import (
 	"EasySwapBackend-test/src/app"
 	"EasySwapBackend-test/src/config"
 	"EasySwapBackend-test/src/router"
-	"EasySwapBackend-test/src/service/svc"
+	"EasySwapBackend-test/src/svc"
 	"flag"
 )
 

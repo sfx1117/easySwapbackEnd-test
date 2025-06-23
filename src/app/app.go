@@ -2,7 +2,7 @@ package app
 
 import (
 	"EasySwapBackend-test/src/config"
-	"EasySwapBackend-test/src/service/svc"
+	"EasySwapBackend-test/src/svc"
 	"context"
 	"github.com/ProjectsTask/EasySwapBase/logger/xzap"
 	"github.com/gin-gonic/gin"

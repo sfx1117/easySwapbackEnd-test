@@ -1,7 +1,7 @@
 package router
 
 import (
-	"EasySwapBackend-test/src/service/svc"
+	"EasySwapBackend-test/src/svc"
 	"github.com/gin-gonic/gin"
 )
 
