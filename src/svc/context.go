@@ -1,6 +1,7 @@
 package svc
 
 import (
+	cached "EasySwapBackend-test/src/cache"
 	"EasySwapBackend-test/src/config"
 	"EasySwapBackend-test/src/dao"
 	"context"
@@ -19,6 +20,7 @@ type ServerCtx struct {
 	C        *config.Config
 	DB       *gorm.DB
 	Dao      *dao.Dao
+	Cached   *cached.Cached
 	KvStore  *xkv.Store
 	RankKey  string
 	NodeSrvs map[int64]*nftchainservice.Service
@@ -72,8 +74,11 @@ func NewServiceContext(c *config.Config) (*ServerCtx, error) {
 	//5、dao层初始化
 	dao := dao.New(context.Background(), db, store)
 
-	//6、创建服务上下文
-	serverCtx := NewServerCtx(WithDao(dao), WithDB(db), WithKv(store))
+	//6、初始化cache
+	cached := cached.NewCache(context.Background(), store)
+
+	//7、创建服务上下文
+	serverCtx := NewServerCtx(WithDao(dao), WithDB(db), WithKv(store), WithCached(cached))
 	serverCtx.C = c
 	serverCtx.NodeSrvs = nodeSrvs
 	return serverCtx, nil

@@ -1,6 +1,7 @@
 package svc
 
 import (
+	cached "EasySwapBackend-test/src/cache"
 	"EasySwapBackend-test/src/dao"
 	"github.com/ProjectsTask/EasySwapBase/evm/erc"
 	"github.com/ProjectsTask/EasySwapBase/stores/xkv"
@@ -15,6 +16,7 @@ type CtxConfig struct {
 	db      *gorm.DB
 	dao     *dao.Dao
 	KvStore *xkv.Store
+	Cached  *cached.Cached
 	Evm     erc.Erc
 }
 
@@ -32,6 +34,7 @@ func NewServerCtx(options ...CtxOption) *ServerCtx {
 		DB:      c.db,
 		Dao:     c.dao,
 		KvStore: c.KvStore,
+		Cached:  c.Cached,
 	}
 }
 
@@ -53,5 +56,11 @@ func WithDao(dao *dao.Dao) CtxOption {
 func WithKv(kv *xkv.Store) CtxOption {
 	return func(conf *CtxConfig) {
 		conf.KvStore = kv
+	}
+}
+
+func WithCached(cached *cached.Cached) CtxOption {
+	return func(conf *CtxConfig) {
+		conf.Cached = cached
 	}
 }
