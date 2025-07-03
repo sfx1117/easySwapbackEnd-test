@@ -16,6 +16,12 @@ type CollectionTrade struct {
 	PreFlooPrice    decimal.Decimal `json:"pre_fool_price"`
 	FlooChange      int             `json:"fool_change"`
 }
+type TradeStats struct {
+	CollectionAddress string
+	ItemCount         int64
+	Volume            decimal.Decimal
+	FloorPrice        decimal.Decimal
+}
 
 type periodEpochMap map[string]int
 
@@ -126,4 +132,77 @@ func (dao *Dao) QueryCollectionVolume(ctx context.Context, chain, collectionAddr
 		return decimal.Zero, errors.Wrap(err, "failed to get collection volume")
 	}
 	return volume, nil
+}
+
+// 根据Activity获取集合排行榜信息
+func (dao *Dao) GetCollectionRankingByActivity(chain, period string) ([]*CollectionTrade, error) {
+	//1、解析时间段，获取时间对应的epoch
+	epoch, ok := periodToEpoch[period]
+	if !ok {
+		return nil, errors.Errorf("invalid period: %s", period)
+	}
+	//计算当前查询时间段
+	startTime := time.Now().Add(-time.Duration(epoch) * time.Minute)
+	endTime := time.Now()
+	//计算上一个时间段
+	prevStartTime := startTime.Add(-time.Duration(epoch) * time.Minute)
+	prevEndTime := startTime
+
+	//2、获取当前时间段的交易统计
+	var currentStats []TradeStats
+	err := dao.DB.WithContext(dao.ctx).
+		Table(multi.ActivityTableName(chain)).
+		Select("collection_address, COUNT(*) as item_count, COALESCE(SUM(price), 0) as volume, COALESCE(MIN(price), 0) as floor_price").
+		Where("activity_type = ? AND event_time >= ? AND event_time <= ?", multi.Sale, startTime, endTime).
+		Group("collection_address").
+		Find(&currentStats).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get current stats")
+	}
+
+	//3、获取上一个时间段的交易统计
+	var prevStats []TradeStats
+	err = dao.DB.WithContext(dao.ctx).
+		Table(multi.ActivityTableName(chain)).
+		Select("collection_address, COUNT(*) as item_count, COALESCE(SUM(price), 0) as volume, COALESCE(MIN(price), 0) as floor_price").
+		Where("activity_type = ? AND event_time >= ? AND event_time <= ?", multi.Sale, prevStartTime, prevEndTime).
+		Group("collection_address").
+		Find(&prevStats).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get prev stats")
+	}
+	//将数据构建成map结构
+	prevStatsMap := make(map[string]TradeStats)
+	for _, stat := range prevStats {
+		prevStatsMap[stat.CollectionAddress] = stat
+	}
+
+	//4、构建返回参数
+	var result []*CollectionTrade
+	for _, curr := range currentStats {
+		trade := &CollectionTrade{
+			ContractAddress: curr.CollectionAddress,
+			ItemCount:       curr.ItemCount,
+			Volume:          curr.Volume,
+			VolumeChange:    0,
+			PreFlooPrice:    decimal.Zero,
+			FlooChange:      0,
+		}
+		//计算变化率，(当前-上个)/上个
+		if prev, ok := prevStatsMap[curr.CollectionAddress]; ok {
+			trade.PreFlooPrice = prev.FloorPrice
+
+			if !prev.Volume.IsZero() {
+				volumeChange := curr.Volume.Sub(prev.Volume).Div(prev.Volume).Mul(decimal.NewFromInt(100))
+				trade.VolumeChange = int(volumeChange.IntPart())
+			}
+
+			if !prev.FloorPrice.IsZero() {
+				flooChange := curr.FloorPrice.Sub(prev.FloorPrice).Div(prev.FloorPrice).Mul(decimal.NewFromInt(100))
+				trade.FlooChange = int(flooChange.IntPart())
+			}
+		}
+		result = append(result, trade)
+	}
+	return result, nil
 }

@@ -7,11 +7,36 @@ import (
 	"github.com/ProjectsTask/EasySwapBase/stores/gdb/orderbookmodel/multi"
 	"github.com/pkg/errors"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"time"
 )
 
 const OrderType = 1
 const OrderStatus = 0
+const (
+	BuyNow   = 1
+	HasOffer = 2
+	All      = 3
+)
+const (
+	listTime      = 0
+	listPriceAsc  = 1
+	listPriceDesc = 2
+	salePriceDesc = 3
+	salePriceAsc  = 4
+)
+
+type CollectionItem struct {
+	multi.Item
+	MarketID       int    `json:"market_id"`
+	Listing        bool   `json:"listing"`
+	OrderID        string `json:"order_id"`
+	OrderStatus    int    `json:"order_status"`
+	ListMaker      string `json:"list_maker"`
+	ListTime       int64  `json:"list_time"`
+	ListExpireTime int64  `json:"list_expire_time"`
+	ListSalt       int64  `json:"list_salt"`
+}
 
 /*
 *
@@ -127,4 +152,507 @@ func (dao *Dao) QueryItemBids(ctx context.Context, chain, collectionAddr, tokenI
 		return nil, 0, errors.Wrap(db.Error, "failed on count user items")
 	}
 	return itemBids, count, nil
+}
+
+// QueryCollectionItemOrder 查询集合内NFT Item的订单信息
+func (dao *Dao) QueryCollectionItemOrder(ctx context.Context, chain, collectionAddr string, filter entity.CollectionItemFilterParam) ([]*CollectionItem, int64, error) {
+	//1、如果未指定市场，则默认使用OrderBookDex
+	if len(filter.Markets) == 0 {
+		filter.Markets = []int{multi.OrderBookDex}
+	}
+	//2、初始化数据库查询
+	db := dao.DB.WithContext(ctx).Table(fmt.Sprintf("%s as ci", multi.ItemTableName(chain)))
+	coTableName := multi.OrderTableName(chain)
+
+	//3、根据状态过滤查询 组装sql
+	// status: 1-buy now(立即购买), 2-has offer(有报价), 3-all(所有)
+	if len(filter.Status) == 1 { // filter.Status=[1] 或者 filter.Status=[2]
+		// 构建基础SELECT语句  1. 关联订单表和Item表
+		db.Select(
+			"ci.id as id, ci.chain_id as chain_id, " +
+				"ci.collection_address as collection_address,ci.token_id as token_id, " +
+				"ci.name as name, ci.owner as owner, " +
+				"min(co.price) as list_price, " +
+				"SUBSTRING_INDEX(GROUP_CONCAT(co.marketplace_id ORDER BY co.price,co.marketplace_id),',', 1) AS market_id, " +
+				"min(co.price) != 0 as listing").
+			Joins(fmt.Sprintf("join %s co on co.collection_address=ci.collection_address "+
+				"and co.token_id=ci.token_id", coTableName))
+
+		//处理立即购买状态
+		if filter.Status[0] == BuyNow {
+			// 2. 条件:集合地址匹配、订单类型为listing、订单状态active、卖家是Item所有者
+			db.Where("co.collection_address = ? and co.order_type = ? and co.order_status=? and co.maker = ci.owner",
+				collectionAddr, multi.ListingOrder, multi.OrderStatusActive)
+
+		} else if filter.Status[0] == HasOffer { //处理立即购买状态
+			// 2. 条件:集合地址匹配、订单类型为offer、订单状态active
+			db.Where("co.collection_address = ? and co.order_type = ? and co.order_status=?",
+				collectionAddr, multi.OfferOrder, multi.OrderStatusActive)
+		}
+
+		//根据市场id过滤
+		if len(filter.Markets) == 1 {
+			db.Where("co.marketplace_id = ?", filter.Markets[0])
+		} else if len(filter.Markets) != 5 {
+			db.Where("co.marketplace_id in (?)", filter.Markets)
+		}
+		//根据tokenId过滤
+		if filter.TokenID != "" {
+			db.Where("co.token_id = ?", filter.TokenID)
+		}
+		//根据用户地址过滤
+		if filter.UserAddress != "" {
+			db.Where("ci.owner = ?", filter.UserAddress)
+		}
+		//分组条件
+		db.Group("co.token_id")
+
+	} else if len(filter.Status) == 2 { // 处理同时有买卖订单的情况 即 filter.Status=[1,2]
+		// SQL解释:
+		// 1. 关联订单表和Item表
+		// 2. 条件:订单状态active、卖家是Item所有者
+		// 3. 分组后需同时存在listing和offer订单
+		db.Select(
+			"ci.id as id, ci.chain_id as chain_id,"+
+				"ci.collection_address as collection_address,ci.token_id as token_id, "+
+				"ci.name as name, ci.owner as owner, "+
+				"min(co.price) as list_price, "+
+				"SUBSTRING_INDEX(GROUP_CONCAT(co.marketplace_id ORDER BY co.price,co.marketplace_id),',', 1) AS market_id").
+			Joins(fmt.Sprintf(
+				"join %s co on co.collection_address=ci.collection_address and co.token_id=ci.token_id",
+				coTableName)).
+			Where(
+				"co.collection_address = ? and co.order_status=? and co.maker = ci.owner",
+				collectionAddr, multi.OrderStatusActive)
+		//根据市场id过滤
+		if len(filter.Markets) == 1 {
+			db.Where("co.marketplace_id = ?", filter.Markets[0])
+		} else if len(filter.Markets) != 5 {
+			db.Where("co.marketplace_id in (?)", filter.Markets)
+		}
+		//根据tokenId过滤
+		if filter.TokenID != "" {
+			db.Where("co.token_id = ?", filter.TokenID)
+		}
+		//根据用户地址过滤
+		if filter.UserAddress != "" {
+			db.Where("ci.owner = ?", filter.UserAddress)
+		}
+		//分组条件
+		db.Group("co.token_id").
+			Having("min(co.order_type) = ? and max(co.order_type) = ?", multi.ListingOrder, multi.OfferOrder)
+	} else { // 处理所有状态 即 filter.Status=[3]
+		// 1. 子查询获取每个token的最低listing价格
+		// 2. 左连接子查询结果到Item表
+		// 3. 根据条件过滤
+		subQuery := dao.DB.WithContext(ctx).Table(
+			fmt.Sprintf("%s as cis", multi.ItemTableName(chain))).
+			Select(
+				"cis.id as item_id,cis.collection_address as collection_address,"+
+					"cis.token_id as token_id, cis.owner as owner, cos.order_id as order_id, "+
+					"min(cos.price) as list_price, "+
+					"SUBSTRING_INDEX(GROUP_CONCAT(cos.marketplace_id ORDER BY cos.price,cos.marketplace_id),',', 1) AS market_id, "+
+					"min(cos.price) != 0 as listing").
+			Joins(fmt.Sprintf(
+				"join %s cos on cos.collection_address=cis.collection_address and cos.token_id=cis.token_id",
+				coTableName)).
+			Where(
+				"cos.collection_address = ? and cos.order_type = ? and cos.order_status=? "+
+					"and cos.maker = cis.owner",
+				collectionAddr, multi.ListingOrder, multi.OrderStatusActive)
+
+		if len(filter.Markets) == 1 {
+			subQuery.Where("cos.marketplace_id = ?", filter.Markets[0])
+		} else if len(filter.Markets) != 5 {
+			subQuery.Where("cos.marketplace_id in (?)", filter.Markets)
+		}
+		subQuery.Group("cos.token_id")
+
+		db.Select("ci.id as id, ci.chain_id as chain_id,"+
+			"ci.collection_address as collection_address, ci.token_id as token_id, "+
+			"ci.name as name, ci.owner as owner, "+
+			"co.list_price as list_price, co.market_id as market_id, co.listing as listing").
+			Joins("left join (?) co on co.collection_address=ci.collection_address and co.token_id=ci.token_id", subQuery).
+			Where("ci.collection_address = ?", collectionAddr)
+		//根据tokenId过滤
+		if filter.TokenID != "" {
+			db.Where("co.token_id = ?", filter.TokenID)
+		}
+		//根据用户地址过滤
+		if filter.UserAddress != "" {
+			db.Where("ci.owner = ?", filter.UserAddress)
+		}
+	}
+	//4、统计总记录数
+	var count int64
+	countSessionTx := db.Session(&gorm.Session{})
+	err := countSessionTx.Count(&count).Error
+	if err != nil {
+		return nil, 0, errors.Wrap(db.Error, "failed on count items")
+	}
+
+	//5、处理排序
+	if len(filter.Status) == 0 {
+		db.Order("listing desc")
+	}
+	if filter.Sort == 0 {
+		filter.Sort = listPriceAsc
+	}
+	//5.1、根据不同排序条件设置ORDER BY
+	switch filter.Sort {
+	case listTime:
+		db.Order("list_time desc,ci.id asc")
+	case listPriceAsc:
+		db.Order("list_price asc, ci.id asc")
+	case listPriceDesc:
+		db.Order("list_price desc,ci.id asc")
+	case salePriceDesc:
+		db.Order("sale_price desc,ci.id asc")
+	case salePriceAsc:
+		db.Order("sale_price = 0,sale_price asc,ci.id asc")
+	}
+
+	//6、分页查询
+	var items []*CollectionItem
+	err = db.Limit(filter.PageSize).
+		Offset(filter.PageSize * (filter.Page - 1)).
+		Scan(&items).Error
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "failed on get query items info")
+	}
+	return items, count, nil
+}
+
+// QueryListingInfo 查询订单上架信息
+// 该函数主要功能:
+// 1、根据传入的价格信息列表查询对应的订单信息
+// 2、每个价格信息包含：集合地址，代币id，创建者，价格，订单状态
+// 3、返回的订单信息包含：集合地址，代币id，订单id，创建时间，过期时间，盐
+func (dao *Dao) QueryListingInfo(ctx context.Context, chain string, itemPrice []entity.ItemPriceInfo) ([]multi.Order, error) {
+	//1、构建查询条件
+	var conditions []clause.Expr
+	for _, item := range itemPrice {
+		conditions = append(conditions,
+			gorm.Expr("(?, ?, ?, ?, ?)",
+				item.CollectionAddress,
+				item.TokenId,
+				item.Maker,
+				item.OrderStatus,
+				item.Price,
+			))
+	}
+	//2、sql查询
+	var ordersInfo []multi.Order
+	err := dao.DB.WithContext(ctx).Table(multi.OrderTableName(chain)).
+		Select("collection_address,token_id,order_id,event_time,expire_time,salt,maker").
+		Where("(collection_address,token_id,maker,order_status,price) in (?)", conditions).
+		Scan(&ordersInfo).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on query items order id")
+	}
+	return ordersInfo, nil
+}
+
+type UserItemCount struct {
+	Owner  string `json:"owner"`
+	Counts int64  `json:"counts"`
+}
+
+// QueryUserItemCount 查询用户持有NFT数量统计
+// 该函数主要功能:
+// 1. 根据链名称、集合地址和用户地址列表查询每个用户持有的NFT数量
+// 2. 返回用户地址和对应的NFT持有数量
+func (dao *Dao) QueryUserItemCount(ctx context.Context, chain, collectionAddr string, owners []string) ([]UserItemCount, error) {
+	var userItemCount []UserItemCount
+	err := dao.DB.WithContext(ctx).
+		Table(multi.ItemTableName(chain)).
+		Select("owner,count(*) as counts").
+		Where("collection_address = ? and owner in (?)", collectionAddr, owners).
+		Group("owner").
+		Scan(&userItemCount).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on get user item count")
+	}
+	return userItemCount, nil
+}
+
+// QueryLastSalePrice 查询NFT最近的销售价格
+// 该函数主要功能:
+// 1. 根据链名称、集合地址和代币ID列表查询每个NFT最近一次的销售价格
+// 2. 返回NFT的集合地址、代币ID和对应的销售价格
+func (dao *Dao) QueryLastSalePrice(ctx context.Context, chain, collectionAddr string, owners []string) ([]multi.Activity, error) {
+	var lastSales []multi.Activity
+	sql := fmt.Sprintf(`
+		SELECT a.collection_address, a.token_id, a.price
+		FROM %s a
+		INNER JOIN (
+			SELECT collection_address,token_id, 
+				MAX(event_time) as max_event_time
+			FROM %s
+			WHERE collection_address = ?
+				AND token_id IN (?)
+				AND activity_type = ?
+			GROUP BY collection_address,token_id
+		) groupedA 
+		ON a.collection_address = groupedA.collection_address
+		AND a.token_id = groupedA.token_id
+		AND a.event_time = groupedA.max_event_time
+		AND a.activity_type = ?`,
+		multi.ActivityTableName(chain),
+		multi.ActivityTableName(chain))
+	err := dao.DB.Raw(sql, collectionAddr, owners, multi.Sale, multi.Sale).
+		Scan(&lastSales).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on get item last sale price")
+	}
+	return lastSales, nil
+}
+
+// QueryBestBids 查询NFT的最佳出价信息
+// 该函数主要功能:
+// 1. 根据链名称、用户地址、集合地址和代币ID列表查询NFT的出价信息
+// 2. 返回符合条件的出价订单列表
+// 3. 如果指定了用户地址,则排除该用户的出价
+func (dao *Dao) QueryBestBids(ctx context.Context, chain, collectionAddr, userAddr string, tokenIds []string) ([]multi.Order, error) {
+	var bestBids []multi.Order
+	var sql string
+	// SQL解释:
+	// 1. 查询订单表中符合条件的出价记录
+	// 2. 条件包括:
+	//    - 指定集合地址
+	//    - 指定代币ID列表
+	//    - 订单类型为出价单
+	//    - 订单状态为激活
+	//    - 未过期
+	//    - 剩余数量大于0
+	//    - 如果指定用户地址,则排除该用户的出价
+	if userAddr == "" {
+		sql = fmt.Sprintf(`
+			SELECT order_id, token_id, event_time, price, salt, 
+				expire_time, maker, order_type, quantity_remaining, size   
+			FROM %s
+			WHERE collection_address = ?
+				AND token_id IN (?)
+				AND order_type = ?
+				AND order_status = ?
+				AND expire_time > ?
+				AND quantity_remaining > 0
+		`, multi.OrderTableName(chain))
+	} else {
+		sql = fmt.Sprintf(`
+			SELECT order_id, token_id, event_time, price, salt, 
+				expire_time, maker, order_type, quantity_remaining, size   
+			FROM %s
+			WHERE collection_address = ?
+				AND token_id IN (?)
+				AND order_type = ?
+				AND order_status = ?
+				AND expire_time > ?
+				AND quantity_remaining > 0
+				AND maker != '%s'
+		`, multi.OrderTableName(chain), userAddr)
+	}
+	err := dao.DB.Raw(sql, collectionAddr, tokenIds, multi.ItemBidOrder, multi.OrderStatusActive, time.Now().Unix()).
+		Scan(&bestBids).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on get item best bids")
+	}
+	return bestBids, nil
+}
+
+// QueryCollectionBestBid 查询集合最高出价信息
+// 该函数主要功能:
+// 1. 根据链名称、用户地址和集合地址查询该集合的最高出价订单
+// 2. 如果指定了用户地址,则排除该用户的出价
+// 3. 返回价格最高的一个有效订单(未过期且有剩余数量)
+func (dao *Dao) QueryCollectionBestBid(ctx context.Context, chain, collectionAddr, userAddr string) (multi.Order, error) {
+	var bestBid multi.Order
+	var sql string
+
+	if userAddr == "" {
+		sql = fmt.Sprintf(`SELECT order_id, price, event_time, expire_time, salt, maker, 
+				order_type, quantity_remaining, size  
+			FROM %s
+			WHERE collection_address = ?
+			AND order_type = ?
+			AND order_status = ?
+			AND quantity_remaining > 0
+			AND expire_time > ? 
+			ORDER BY price DESC 
+			LIMIT 1`,
+			multi.OrderTableName(chain))
+	} else {
+		sql = fmt.Sprintf(`SELECT order_id, price, event_time, expire_time, salt, maker, 
+				order_type, quantity_remaining, size  
+			FROM %s
+			WHERE collection_address = ?
+			AND order_type = ?
+			AND order_status = ?
+			AND quantity_remaining > 0
+			AND expire_time > ? 
+			AND maker != '%s'
+			ORDER BY price DESC 
+			LIMIT 1`,
+			multi.OrderTableName(chain),
+			userAddr)
+	}
+	err := dao.DB.Raw(sql, collectionAddr, multi.ItemBidOrder, multi.OrderStatusActive, time.Now().Unix()).
+		Scan(&bestBid).Error
+	if err != nil {
+		return bestBid, errors.Wrap(err, "failed on get item best bids")
+	}
+	return bestBid, nil
+}
+
+// QueryItemInfo 查询单个NFT Item的详细信息
+func (dao *Dao) QueryItemInfo(ctx context.Context, chain, collectionAddr, tokenId string) (*multi.Item, error) {
+	var item multi.Item
+	// 构建SQL查询
+	// 从items表中查询指定NFT的信息
+	err := dao.DB.WithContext(ctx).
+		Table(fmt.Sprintf("%s as ci", multi.ItemTableName(chain))).
+		Select("ci.id as id, "+
+			"ci.chain_id as chain_id, "+
+			"ci.collection_address as collection_address, "+
+			"ci.token_id as token_id, "+
+			"ci.name as name, "+
+			"ci.owner as owner").
+		Where("ci.collection_address =? and ci.token_id = ? ", collectionAddr, tokenId).
+		Scan(&item).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+	return &item, nil
+}
+
+// QueryItemListInfo 查询单个NFT的挂单信息
+// 主要功能:
+// 1. 查询NFT基本信息(ID、稀有度等)和挂单信息(价格、市场等)
+// 2. 如果有挂单,则查询挂单的详细信息(订单ID、过期时间等)
+func (dao *Dao) QueryItemListInfo(ctx context.Context, chain, collectionAddr, tokenId string) (*CollectionItem, error) {
+	var collectionItem CollectionItem
+	db := dao.DB.WithContext(ctx).Table(fmt.Sprintf("%s as ci", multi.ItemTableName(chain)))
+	coTableName := multi.OrderTableName(chain)
+	// SQL解释:
+	// 1. 从items表和orders表联表查询
+	// 2. 选择NFT基本信息和挂单信息
+	// 3. 按价格升序,取最低价的市场ID
+	// 4. 过滤条件:匹配NFT、活跃订单、owner是卖家
+	err := db.Select("ci.id as id, ci.chain_id as chain_id, "+
+		"ci.collection_address as collection_address,ci.token_id as token_id, "+
+		"ci.name as name, ci.owner as owner, "+
+		"min(co.price) as list_price, "+
+		"SUBSTRING_INDEX(GROUP_CONCAT(co.marketplace_id ORDER BY co.price,co.marketplace_id),',', 1) AS market_id, "+
+		"min(co.price) != 0 as listing").
+		Joins(fmt.Sprintf("join %s co on co.collection_address=ci.collection_address "+
+			"and co.token_id=ci.token_id", coTableName)).
+		Where("ci.collection_address =? and ci.token_id = ? and co.order_type = ? and co.order_status=? "+
+			"and co.maker = ci.owner", collectionAddr, tokenId, multi.ListingOrder, multi.OrderStatusActive).
+		Group("ci.collection_address,ci.token_id").
+		Scan(&collectionItem).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on query user items list info")
+	}
+	//如果没有挂单，则直接返回
+	if !collectionItem.Listing {
+		return &collectionItem, nil
+	}
+	//如果有挂单，则查询挂单详情
+	var listOrder multi.Order
+	// SQL解释:
+	// 如果有挂单,查询订单详细信息
+	// 1. 从orders表查询订单ID、过期时间等信息
+	// 2. 匹配NFT、卖家、状态和价格
+	err = dao.DB.WithContext(ctx).Table(multi.OrderTableName(chain)).
+		Select("order_id, expire_time, maker, salt, event_time").
+		Where("collection_address=? and token_id=? and maker=? and order_status=? and price = ?",
+			collectionItem.CollectionAddress, collectionItem.TokenId, collectionItem.Owner,
+			multi.OrderStatusActive, collectionItem.ListPrice).
+		Scan(&listOrder).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on query item order id")
+	}
+	collectionItem.OrderID = listOrder.OrderID
+	collectionItem.ListSalt = listOrder.Salt
+	collectionItem.ListExpireTime = listOrder.ExpireTime
+	collectionItem.ListMaker = listOrder.Maker
+	collectionItem.ListTime = listOrder.EventTime
+	return &collectionItem, nil
+}
+
+// QueryTraitsPrice 查询NFT Trait的价格信息
+// 主要功能:
+// 1. 查询指定NFT集合中特定token id的 Trait价格
+// 2. 通过关联订单表和 Trait表,找出每个 Trait对应的最低挂单价格
+// 3. 返回 Trait价格列表
+func (dao *Dao) QueryTraitPrice(ctx context.Context, chain, collectionAddr string, tokenIds []string) ([]entity.TraitPrice, error) {
+	var traitPrice []entity.TraitPrice
+	//构建子查询,查询指定item的trait信息
+	listSubQuery := dao.DB.WithContext(ctx).
+		Table(fmt.Sprintf("%s as gf_order", multi.OrderTableName(chain))).
+		// 查询字段: Trait名称、 Trait值、最低价格
+		Select("gf_attribute.trait,gf_attribute.trait_value,min(gf_order.price) as price").
+		// 条件1:匹配集合地址、订单类型为挂单、订单状态为活跃
+		Where("gf_order.collection_address=? and gf_order.order_type=? and gf_order.order_status = ?",
+			collectionAddr, multi.ListingOrder, multi.OrderStatusActive).
+		// 条件2: Trait必须在指定token的 Trait列表中
+		Where("(gf_attribute.trait,gf_attribute.trait_value) in (?)",
+			dao.DB.WithContext(ctx).
+				Table(fmt.Sprintf("%s as gf_attr", multi.ItemTraitTableName(chain))).
+				Select("gf_attr.trait, gf_attr.trait_value").
+				Where("gf_attr.collection_address=? and gf_attr.token_id in (?)", collectionAddr, tokenIds))
+	// 关联 Trait表,按 Trait分组查询
+	err := listSubQuery.Joins(fmt.Sprintf("join %s as gf_attribute on gf_order.collection_address = gf_attribute.collection_address "+
+		"and gf_order.token_id=gf_attribute.token_id", multi.ItemTraitTableName(chain))).
+		Group("gf_attribute.trait, gf_attribute.trait_value").
+		Scan(&traitPrice).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on query trait price")
+	}
+	return traitPrice, nil
+}
+
+// 更新NFT所有者
+func (dao *Dao) UpdateItemOwner(ctx context.Context, chain, collectionAddr, tokenId, owner string) error {
+	err := dao.DB.WithContext(ctx).
+		Table(multi.ItemTableName(chain)).
+		Update("owner", owner).
+		Where("collection_address = ? and token_id = ?", collectionAddr, tokenId).
+		Error
+	if err != nil {
+		return errors.Wrap(err, "failed on get user item count")
+	}
+	return nil
+}
+
+// 查询多个集合中已上架NFT的数量
+func (dao *Dao) QueryListedAmountEachCollection(ctx context.Context, chain string, collectionAddrs, userAddrs []string) ([]entity.CollectionInfo, error) {
+	var counts []entity.CollectionInfo
+	// SQL解释:
+	// 1. 从Item表(ci)和订单表(co)联表查询
+	// 2. 选择字段:
+	//    - ci.collection_address 作为 address
+	//    - count(distinct co.token_id) 作为 list_amount,统计每个集合中不重复的tokenID数量
+	// 3. 关联条件:集合地址和tokenID都相同
+	// 4. WHERE条件:
+	//    - 集合地址在给定列表中
+	//    - NFT所有者在给定用户列表中
+	//    - 订单类型为listing(OrderType=1)
+	//    - 订单状态为active(OrderStatus=0)
+	//    - 卖家是NFT当前所有者
+	//    - 排除marketplace_id=1的订单
+	// 5. 按集合地址分组,获取每个集合的统计结果
+	sql := fmt.Sprintf(`SELECT  ci.collection_address as address, count(distinct (co.token_id)) as list_amount
+			FROM %s as ci
+					join %s co on co.collection_address = ci.collection_address and co.token_id = ci.token_id
+			WHERE (co.collection_address in (?) and ci.owner in (?) and co.order_type = ? and
+				co.order_status = ? and co.maker = ci.owner and co.marketplace_id != ?) group by ci.collection_address`,
+		multi.ItemTableName(chain), multi.CollectionTableName(chain))
+	err := dao.DB.WithContext(ctx).
+		Raw(sql, collectionAddrs, userAddrs, OrderType, OrderStatus, 1).
+		Scan(&counts).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on get listed item amount")
+	}
+	return counts, nil
 }

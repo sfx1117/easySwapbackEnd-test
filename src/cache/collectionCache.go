@@ -13,3 +13,12 @@ func (cached *Cached) CacheCollectionsListed(chain, collectionAddr string, liste
 	}
 	return nil
 }
+
+// 获取缓存 集合的上架数量
+func (cached *Cached) GetCollectionsListed(chain, collectionAddr string) (int, error) {
+	listedCount, err := cached.KvStore.GetInt(ordermanager.GenCollectionListedKey(chain, collectionAddr))
+	if err != nil {
+		return 0, errors.Wrap(err, "failed on get collection listed count")
+	}
+	return listedCount, nil
+}
