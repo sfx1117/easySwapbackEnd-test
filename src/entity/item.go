@@ -82,3 +82,13 @@ type ItemOwner struct {
 	TokenID           string `json:"token_id"`
 	Owner             string `json:"owner"`
 }
+
+type ItemInfo struct {
+	CollectionAddress string `json:"collection_address"`
+	TokenID           string `json:"token_id"`
+}
+
+type MultiChainItemInfo struct {
+	ItemInfo  ItemInfo
+	ChainName string
+}

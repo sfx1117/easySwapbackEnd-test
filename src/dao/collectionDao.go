@@ -2,6 +2,7 @@ package dao
 
 import (
 	"EasySwapBackend-test/src/entity"
+	"EasySwapBackend-test/src/utils"
 	"context"
 	"fmt"
 	"github.com/ProjectsTask/EasySwapBase/ordermanager"
@@ -320,4 +321,111 @@ func (dao *Dao) QueryMultiChainUserCollectionInfos(ctx context.Context, chainIds
 		return nil, errors.Wrap(err, "failed on get user multi chain collection infos")
 	}
 	return userCollections, nil
+}
+
+// 查询用户拥有nft的Item基本信息，list信息和bid信息，从Item表和Activity表中查询
+func (dao *Dao) QueryMultiChainUserItemInfos(ctx context.Context, chains, userAddrs, collectionAddrs []string,
+	page, pageSize int) ([]entity.PortfolioItemInfo, int64, error) {
+	var total int64
+	var items []entity.PortfolioItemInfo
+
+	//1、构建列表查询sql
+	//1.1 构建查询sql头部
+	sqlHead := "select * from ("
+	//1.2 构建查询sql中部 - 使用UNION ALL合并多个链的查询
+	sqlMid := ""
+	for _, chain := range chains {
+		//为每个链构建子查询
+		if sqlMid == "" {
+			sqlMid += " union all "
+		}
+		//查询字段：chain_id, collection_address, token_id, name, owner, owned_time
+		sqlMid += "(select gi.chain_id as chain_id, " +
+			"gi.collection_address as collection_address, " +
+			"gi.token_id as token_id, " +
+			"gi.name as name, " +
+			"gi.owner as owner, " +
+			"sub.last_event_time as owned_time "
+		sqlMid += fmt.Sprintf("from %s as gi ", multi.ItemTableName(chain))
+		//左连接查询
+		sqlMid += "left join (select sgi.collection_address, sgi.token_id, max(sga.event_time) as last_event_time "
+		sqlMid += fmt.Sprintf("from %s as sgi left join %s as sga ", multi.ItemTableName(chain), multi.ActivityTableName(chain))
+		sqlMid += "on sgi.collection_address = sga.collection_address and sgi.token_id = sga.token_id "
+		sqlMid += fmt.Sprintf("where sgi.owner in (%s) and sga.activity_type = %d ", userAddrs, multi.Sale)
+		// 如果指定了合约地址,添加合约地址过滤条件
+		if len(collectionAddrs) > 0 {
+			sqlMid += fmt.Sprintf("and sgi.collection_address in ('%s'", collectionAddrs[0])
+			for i := 1; i < len(collectionAddrs); i++ {
+				sqlMid += fmt.Sprintf(",'%s'", collectionAddrs[i])
+			}
+			sqlMid += ")"
+		}
+		sqlMid += "group by sgi.collection_address, sgi.token_id) sub " +
+			"on gi.collection_address = sub.collection_address and gi.token_id = sub.token_id "
+		//过滤指定用户持有的Item
+		sqlMid += fmt.Sprintf("where gi.owner in ('%s'", userAddrs[0])
+		for i := 1; i < len(userAddrs); i++ {
+			sqlMid += fmt.Sprintf(",'%s'", userAddrs[i])
+		}
+		sqlMid += ")"
+		if len(collectionAddrs) > 0 {
+			sqlMid += fmt.Sprintf("and gi.collection_address in ('%s'", collectionAddrs[0])
+			for i := 1; i < len(collectionAddrs); i++ {
+				sqlMid += fmt.Sprintf(",'%s'", collectionAddrs[i])
+			}
+			sqlMid += ")"
+		}
+		sqlMid += ")"
+	}
+	//1.3 构建查询sql尾部
+	sqlTail := fmt.Sprintf(") as combined ORDER BY combined.owned_time DESC LIMIT %d OFFSET %d", pageSize, pageSize*(page-1))
+	//1.4 组合查询sql
+	sql := sqlHead + sqlMid + sqlTail
+
+	//2、构建计数sql
+	//2.1、构建计数sql头部
+	sqlCntHead := "select count(*) from ("
+	//2.2、构建计数sql中部
+	sqlCntMid := sqlMid
+	//2.3、构建计数sql尾部
+	sqlCntTail := ") as combined"
+	//2.4 组合计数sql
+	sqlCnt := sqlCntHead + sqlCntMid + sqlCntTail
+
+	//3、执行计数sql
+	err := dao.DB.WithContext(ctx).Raw(sqlCnt).Scan(&total).Error
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "failed on count user multi chain items")
+	}
+	//4、执行查询sql
+	err = dao.DB.WithContext(ctx).Raw(sql).Scan(&items).Error
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "failed on get user multi chain items")
+	}
+	return items, total, nil
+}
+
+/*
+*
+批量查询多条链上的NFT集合信息
+// 参数collectionAddrs是一个二维数组,每个元素包含[合约地址,链名称]
+// 返回多条链上的NFT集合信息列表
+*/
+func (dao *Dao) QueryMultiChainCollectionsInfo(ctx context.Context, collectionAddrs [][]string) ([]multi.Collection, error) {
+	//去重
+	addrs := utils.RemoveRepeatedElementArr(collectionAddrs)
+	var collections []multi.Collection
+	var collection multi.Collection
+	for _, addr := range addrs {
+		err := dao.DB.WithContext(ctx).
+			Table(multi.CollectionTableName(addr[1])).
+			Select(collectionDetailFields).
+			Where("address = ?", addr[0]).
+			Scan(&collection).Error
+		if err != nil {
+			return nil, errors.Wrap(err, "failed on get collection info")
+		}
+		collections = append(collections, collection)
+	}
+	return collections, nil
 }

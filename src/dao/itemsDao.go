@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"strings"
 	"time"
 )
 
@@ -655,4 +656,218 @@ func (dao *Dao) QueryListedAmountEachCollection(ctx context.Context, chain strin
 		return nil, errors.Wrap(err, "failed on get listed item amount")
 	}
 	return counts, nil
+}
+
+/*
+*
+查询多个集合的最高出价信息
+// 该函数主要功能:
+// 1. 根据链名称、用户地址和集合地址列表查询每个集合的最高出价订单
+// 2. 如果指定了用户地址,则排除该用户的出价
+// 3. 返回每个集合中价格最高的有效订单(未过期且有剩余数量)
+*/
+func (dao *Dao) QueryCollectionsBestBid(ctx context.Context, chain string, userAddr string, collectionAddrs []string) ([]*multi.Order, error) {
+	var bestBids []*multi.Order
+	// 1. 主查询:从订单表中查询订单详细信息
+	sql := fmt.Sprintf("SELECT collection_address, order_id, price,event_time, expire_time, salt, maker, order_type, quantity_remaining, size  FROM %s ", multi.OrderTableName(chain))
+	// 2. 子查询:获取每个集合的最高出价
+	sql += fmt.Sprintf("where (collection_address,price) in (SELECT collection_address, max(price) as price FROM %s ", multi.OrderTableName(chain))
+	// 3. 子查询条件:
+	//   - 集合地址在给定列表中
+	//   - 订单类型为集合出价单
+	//   - 订单状态为活跃
+	//   - 剩余数量大于0
+	//   - 未过期
+	//   - 如果指定用户地址,则排除该用户
+	sql += "where collection_address in (?) and order_type = ? and order_status = ? and quantity_remaining > 0 and expire_time > ? "
+	if userAddr != "" {
+		sql += fmt.Sprintf("and maker != '%s' ", userAddr)
+	}
+	sql += "group by collection_address ) "
+	// 4. 主查询条件:与子查询条件相同
+	sql += "and order_type = ? and order_status = ? and quantity_remaining > 0 and expire_time > ? "
+	if userAddr != "" {
+		sql += fmt.Sprintf("and maker != '%s' ", userAddr)
+	}
+	//5、执行查询sql
+	err := dao.DB.WithContext(ctx).
+		Raw(sql, collectionAddrs, multi.CollectionBidOrder, multi.OrderStatusActive, time.Now().Unix(),
+			multi.CollectionBidOrder, multi.OrderStatusActive, time.Now().Unix()).
+		Scan(&bestBids).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on get item best bids")
+	}
+	return bestBids, nil
+}
+
+/*
+*
+查询多个NFT Item的最高出价信息
+// 主要功能:
+// 1. 根据链名称、用户地址和Itemem信息列表查询ItemItem的最高出价订单
+// 2. 如果指定了用户地址,则排除该用户的出价
+// 3. 返回所有符合条件的有效订单(未过期且有剩余数量)
+*/
+func (dao *Dao) QueryItemsBestBids(ctx context.Context, chain string, userAddr string, itemInfos []entity.ItemInfo) ([]multi.Order, error) {
+	var bestBids []multi.Order
+	sql := ""
+	//构建查询条件，将每个item的集合地址和tokenid拼装成(addr,tokenId)形式
+	var conditions []clause.Expr
+	for _, item := range itemInfos {
+		conditions = append(conditions, gorm.Expr("(?,?)", item.CollectionAddress, item.TokenID))
+	}
+	//根据是否指定用户地址构建不同的SQL
+	if userAddr == "" {
+		sql += fmt.Sprintf(`
+SELECT order_id, token_id, event_time, price, salt, expire_time, maker, order_type, quantity_remaining, size
+    FROM %s
+    WHERE (collection_address,token_id) IN (?)
+      AND order_type = ?
+      AND order_status = ?
+	  AND quantity_remaining > 0
+      AND expire_time > ?
+`, multi.OrderTableName(chain))
+	} else {
+		sql += fmt.Sprintf(`
+SELECT order_id, token_id, event_time, price, salt, expire_time, maker, order_type, quantity_remaining,size 
+    FROM %s
+    WHERE (collection_address,token_id) IN (?)
+      AND order_type = ?
+      AND order_status = ?
+	  AND quantity_remaining > 0
+      AND expire_time > ?
+	  AND maker != '%s'
+`, multi.OrderTableName(chain))
+	}
+	//执行sql查询
+	err := dao.DB.WithContext(ctx).
+		Raw(sql, conditions, multi.ItemBidOrder, multi.OrderStatusActive, time.Now().Unix()).
+		Scan(&bestBids).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on get item best bids")
+	}
+	return bestBids, nil
+}
+
+/*
+*
+查询多条链上用户NFT Item的挂单信息
+// 主要功能:
+// 1. 根据用户地址列表和Item信息列表查询每个Item的挂单状态
+// 2. 支持跨链查询,按链名称分组处理
+// 3. 返回每个Item的挂单价格、市场ID等信息
+*/
+func (dao *Dao) QueryMultiChainUserItemsListInfo(ctx context.Context, userAddrs []string, itemInfos []entity.MultiChainItemInfo) ([]*CollectionItem, error) {
+	var collectionItems []*CollectionItem
+	// 1、构建用户地址参数字符串: 'addr1','addr2',...
+	var userAddrParam string
+	for i, addr := range userAddrs {
+		userAddrParam += fmt.Sprintf("'%s'", addr)
+		if i < len(userAddrs)-1 {
+			userAddrParam += ","
+		}
+	}
+	//2、按链名称对Item信息分组
+	chainItemMap := make(map[string][]entity.ItemInfo)
+	for _, item := range itemInfos {
+		items, ok := chainItemMap[strings.ToLower(item.ChainName)]
+		if ok {
+			items = append(items, item.ItemInfo)
+			chainItemMap[strings.ToLower(item.ChainName)] = items
+		} else {
+			chainItemMap[strings.ToLower(item.ChainName)] = []entity.ItemInfo{item.ItemInfo}
+		}
+	}
+	//3、构建查询sql
+	//3.1、构建sql头
+	sqlHead := "select * from ("
+	//3.2、构建sql中部
+	sqlMid := ""
+	for chain, items := range chainItemMap {
+		if sqlMid != "" {
+			sqlMid += " union all "
+		}
+		// 构建子查询SQL
+		sqlMid += "(select ci.id as id, ci.chain_id as chain_id,ci.collection_address as collection_address," +
+			"ci.token_id as token_id, ci.name as name, ci.owner as owner,min(co.price) as list_price, " +
+			"SUBSTRING_INDEX(GROUP_CONCAT(co.marketplace_id ORDER BY co.price,co.marketplace_id),',', 1) AS market_id, " +
+			"min(co.price) != 0 as listing "
+		// 关联Item表和订单表
+		sqlMid += fmt.Sprintf("from %s as ci ", multi.ItemTableName(chain))
+		sqlMid += fmt.Sprintf("join %s as co ", multi.OrderTableName(chain))
+		sqlMid += "on co.collection_address=ci.collection_address and co.token_id=ci.token_id "
+		// 查询条件:匹配集合地址和tokenID、订单类型为listing、状态为active、卖家是Item所有者
+		sqlMid += "where (co.collection_address,co.token_id) in "
+		sqlMid += fmt.Sprintf("(('%s','%s')", items[0].CollectionAddress, items[0].TokenID)
+		for i := 1; i < len(items); i++ {
+			sqlMid += fmt.Sprintf(",('%s','%s')", items[i].CollectionAddress, items[i].TokenID)
+		}
+		sqlMid += ") "
+		sqlMid += fmt.Sprintf("and co.order_type = %d and co.order_status=%d and co.maker = ci.owner and co.maker in (%s) ",
+			multi.ListingOrder, multi.OrderStatusActive, userAddrParam)
+		//分组条件
+		sqlMid += "group by co.collection_address,co.token_id)"
+	}
+	//3.3、构建sql尾部
+	sqlTail := ") as combined"
+	//3.4、组合sql
+	sql := sqlHead + sqlMid + sqlTail
+
+	//4、执行查询sql
+	err := dao.DB.WithContext(ctx).Raw(sql).Scan(&collectionItems).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on query user multi chain items list info")
+	}
+	return collectionItems, nil
+}
+
+/*
+*
+查询多条链上的NFT挂单信息
+*/
+func (dao *Dao) QueryMultiChainListingInfo(ctx context.Context, priceInfos []entity.MultiChainItemPriceInfo) ([]multi.Order, error) {
+	var orders []multi.Order
+
+	// 1、按链名称对价格信息分组
+	chainPriceMap := make(map[string][]entity.MultiChainItemPriceInfo)
+	for _, price := range priceInfos {
+		items, ok := chainPriceMap[strings.ToLower(price.ChainName)]
+		if ok {
+			items = append(items, price)
+			chainPriceMap[strings.ToLower(price.ChainName)] = items
+		} else {
+			chainPriceMap[strings.ToLower(price.ChainName)] = []entity.MultiChainItemPriceInfo{price}
+		}
+	}
+	//2、构建查询sql
+	//2.1 构建SQL头
+	sqlHead := "select * from ("
+	//2.2 构建sql中部
+	sqlMid := ""
+	for chain, prices := range chainPriceMap {
+		if sqlMid == "" {
+			sqlMid += " union all "
+		}
+
+		sqlMid += "(select collection_address,token_id,order_id,salt,event_time,expire_time,maker "
+		sqlMid += fmt.Sprintf("from %s ", multi.OrderTableName(chain))
+		sqlMid += "where (collection_address,token_id,maker,order_status,price) in "
+		// 构建IN查询条件: (('addr1','id1','maker1',status1,price1),...)
+		sqlMid += fmt.Sprintf("(('%s','%s','%s',%d, %s)", prices[0].CollectionAddress, prices[0].TokenId, prices[0].Maker, prices[0].OrderStatus, prices[0].Price.String())
+		for i := 1; i < len(prices); i++ {
+			sqlMid += fmt.Sprintf(",('%s','%s','%s',%d, %s)", prices[i].CollectionAddress, prices[i].TokenId, prices[i].Maker, prices[i].OrderStatus, prices[i].Price.String())
+		}
+		sqlMid += "))"
+	}
+	//2.3 构建sql尾部
+	sqlTail := ") as combined"
+	//2.4 组合sql
+	sql := sqlHead + sqlMid + sqlTail
+
+	//3、执行sql
+	err := dao.DB.WithContext(ctx).Raw(sql).Scan(&orders).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on get multi chain listing info")
+	}
+	return orders, nil
 }

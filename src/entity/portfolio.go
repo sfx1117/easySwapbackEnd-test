@@ -2,6 +2,10 @@ package entity
 
 import "github.com/shopspring/decimal"
 
+/*
+*
+UserCollections
+*/
 type UserCollectionsParams struct {
 	UserAddresses []string `json:"user_addresses"`
 }
@@ -36,4 +40,64 @@ type ChainInfo struct {
 type UserCollectionsData struct {
 	CollectionInfos []CollectionInfo `json:"collection_info"`
 	ChainInfos      []ChainInfo      `json:"chain_info"`
+}
+
+/*
+*
+UserItems
+*/
+type PortfolioMultiChainItemFilterParams struct {
+	ChainID             []int    `json:"chain_id"`
+	CollectionAddresses []string `json:"collection_addresses"`
+	UserAddresses       []string `json:"user_addresses"`
+
+	Page     int `json:"page"`
+	PageSize int `json:"page_size"`
+}
+type UserItemsResp struct {
+	Result interface{} `json:"result"`
+	Count  int64       `json:"count"`
+}
+type PortfolioItemInfo struct {
+	ChainID            int    `json:"chain_id"`
+	CollectionAddress  string `json:"collection_address"`
+	CollectionName     string `json:"collection_name"`
+	CollectionImageURI string `json:"collection_image_uri"`
+	TokenID            string `json:"token_id"`
+	ImageURI           string `json:"image_uri"`
+
+	LastCostPrice float64         `json:"last_cost_price"`
+	OwnedTime     int64           `json:"owned_time"`
+	Owner         string          `json:"owner"`
+	Listing       bool            `json:"listing"`
+	MarketplaceID int             `json:"marketplace_id"`
+	Name          string          `json:"name"`
+	FloorPrice    decimal.Decimal `json:"floor_price"`
+
+	ListOrderID    string          `json:"list_order_id"`
+	ListTime       int64           `json:"list_time"`
+	ListPrice      decimal.Decimal `json:"list_price"`
+	ListExpireTime int64           `json:"list_expire_time"`
+	ListSalt       int64           `json:"list_salt"`
+	ListMaker      string          `json:"list_maker"`
+
+	BidOrderID    string          `json:"bid_order_id"`
+	BidTime       int64           `json:"bid_time"`
+	BidExpireTime int64           `json:"bid_expire_time"`
+	BidPrice      decimal.Decimal `json:"bid_price"`
+	BidSalt       int64           `json:"bid_salt"`
+	BidMaker      string          `json:"bid_maker"`
+	BidType       int64           `json:"bid_type"`
+	BidSize       int64           `json:"bid_size"`
+	BidUnfilled   int64           `json:"bid_unfilled"`
+}
+
+type MultichainCollection struct {
+	CollectionAddress string `json:"collection_address"`
+	Chain             string `json:"chain"`
+}
+
+type MultiChainItemPriceInfo struct {
+	ItemPriceInfo
+	ChainName string
 }
