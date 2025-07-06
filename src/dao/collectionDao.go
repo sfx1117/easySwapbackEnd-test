@@ -429,3 +429,113 @@ func (dao *Dao) QueryMultiChainCollectionsInfo(ctx context.Context, collectionAd
 	}
 	return collections, nil
 }
+
+// 查询多链上用户挂单Item信息
+func (dao *Dao) QueryMultiChainUserListingItemInfos(ctx context.Context, chain []string, userAddrs []string,
+	contractAddrs []string, page, pageSize int) ([]entity.PortfolioItemInfo, int64, error) {
+	var count int64
+	var items []entity.PortfolioItemInfo
+
+	// 构建用户地址参数字符串
+	var userAddrsParam string
+	for i, addr := range userAddrs {
+		userAddrsParam += fmt.Sprintf(`'%s'`, addr)
+		if i < len(userAddrs)-1 {
+			userAddrsParam += ","
+		}
+	}
+
+	// SQL语句头部
+	sqlCntHead := "SELECT COUNT(*) FROM ("
+	sqlHead := "SELECT * FROM ("
+	// 分页SQL
+	sqlTail := fmt.Sprintf(") as combined ORDER BY combined.owned_time DESC LIMIT %d OFFSET %d",
+		pageSize, page-1)
+	var sqlMids []string
+
+	// 遍历每条链构建SQL
+	for _, chainName := range chain {
+		sqlMid := "("
+		// 查询Item基本信息和最后交易时间
+		sqlMid += "select gi.chain_id as chain_id, gi.collection_address as collection_address, " +
+			"gi.token_id as token_id, gi.name as name, gi.owner as owner, " +
+			"sub.last_event_time as owned_time "
+		sqlMid += fmt.Sprintf("from %s gi ", multi.ItemTableName(chainName))
+		sqlMid += "left join "
+		// 子查询获取每个Item最后的交易时间
+		sqlMid += "(select sgi.collection_address, sgi.token_id, " +
+			"max(sga.event_time) as last_event_time "
+		sqlMid += fmt.Sprintf("from %s sgi join %s sga ",
+			multi.ItemTableName(chainName), multi.ActivityTableName(chainName))
+		sqlMid += "on sgi.collection_address = sga.collection_address " +
+			"and sgi.token_id = sga.token_id "
+		// 过滤条件:指定用户和Sale类型活动
+		sqlMid += fmt.Sprintf("where sgi.owner in (%s) and sga.activity_type = %d ",
+			userAddrsParam, multi.Sale)
+
+		// 添加合约地址过滤
+		if len(contractAddrs) > 0 {
+			sqlMid += fmt.Sprintf("and sgi.collection_address in ('%s'", contractAddrs[0])
+			for i := 1; i < len(contractAddrs); i++ {
+				sqlMid += fmt.Sprintf(",'%s'", contractAddrs[i])
+			}
+			sqlMid += ") "
+		}
+		sqlMid += "group by sgi.collection_address, sgi.token_id) sub "
+		sqlMid += "on gi.collection_address = sub.collection_address " +
+			"and gi.token_id = sub.token_id "
+
+		// 主查询过滤条件
+		sqlMid += fmt.Sprintf("where gi.owner in (%s) ", userAddrsParam)
+		if len(contractAddrs) > 0 {
+			sqlMid += fmt.Sprintf("and gi.collection_address in ('%s'", contractAddrs[0])
+			for i := 1; i < len(contractAddrs); i++ {
+				sqlMid += fmt.Sprintf(",'%s'", contractAddrs[i])
+			}
+			sqlMid += ")"
+		}
+		sqlMid += ")"
+
+		sqlMids = append(sqlMids, sqlMid)
+	}
+
+	// 使用UNION ALL合并多链结果
+	sqlCnt := sqlCntHead
+	sql := sqlHead
+	for i := 0; i < len(sqlMids); i++ {
+		if i != 0 {
+			sql += " UNION ALL "
+			sqlCnt += " UNION ALL "
+		}
+		sql += sqlMids[i]
+		sqlCnt += sqlMids[i]
+	}
+	sql += sqlTail
+	sqlCnt += ") as combined"
+
+	// 执行SQL查询
+	if err := dao.DB.WithContext(ctx).Raw(sqlCnt).Scan(&count).Error; err != nil {
+		return nil, 0, errors.Wrap(err, "failed on count user multi chain items")
+	}
+	if err := dao.DB.WithContext(ctx).Raw(sql).Scan(&items).Error; err != nil {
+		return nil, 0, errors.Wrap(err, "failed on get user multi chain items")
+	}
+
+	return items, count, nil
+}
+
+// 批量查询指定链上的NFT集合信息
+func (dao *Dao) QueryCollectionsInfo(ctx context.Context, chain string, collectionAddrs []string) ([]multi.Collection, error) {
+	//集合地址去重
+	addrs := utils.RemoveRepeatedElement(collectionAddrs)
+	var collections []multi.Collection
+	err := dao.DB.WithContext(ctx).
+		Table(multi.CollectionTableName(chain)).
+		Select(collectionDetailFields).
+		Where("address in (?)", addrs).
+		Scan(&collections).Error
+	if err != nil {
+		return nil, errors.Wrap(err, "failed on get collections info")
+	}
+	return collections, nil
+}

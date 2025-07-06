@@ -37,4 +37,8 @@ func initV1Route(router *gin.Engine, serverCtx *svc.ServerCtx) {
 	portfolio.GET("/collections", controller.UserMultiChainCollectionsHandler(serverCtx)) //获取用户拥有Collection信息
 	portfolio.GET("/items", controller.UserMultiChainItemsHandler(serverCtx))             //查询用户拥有nft的Item基本信息
 	portfolio.GET("/listings", controller.UserMultiChainListingsHandler(serverCtx))       //查询用户挂单的Listing信息
+	portfolio.GET("/bids", controller.UserMultiChainBidsHandler(serverCtx))               //查询用户出价的Bid信息
+
+	orders := apiV1.Group("/bid-orders")
+	orders.GET("", controller.OrderInfosHandler(serverCtx)) //批量查询出价信息
 }
