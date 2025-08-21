@@ -6,6 +6,9 @@ import (
 	"EasySwapBackend-test/src/router"
 	"EasySwapBackend-test/src/svc"
 	"flag"
+	"log"
+	"net/http"
+	_ "net/http/pprof"
 )
 
 const (
@@ -25,6 +28,10 @@ func main() {
 			panic("invalid chain_suffix config")
 		}
 	}
+	// 启动 pprof 服务器
+	go func() {
+		log.Println(http.ListenAndServe(":6060", nil)) // 默认pprof地址
+	}()
 
 	serverCtx, err := svc.NewServiceContext(c)
 	if err != nil {

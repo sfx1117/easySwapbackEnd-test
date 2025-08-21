@@ -3,6 +3,7 @@ package router
 import (
 	"EasySwapBackend-test/src/middleware"
 	"EasySwapBackend-test/src/svc"
+	"github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"
 )
 
@@ -22,5 +23,6 @@ func NewRouter(serverCtx *svc.ServerCtx) *gin.Engine {
 	router.Use(middleware.RLog())              //配置自定义的日志中间件
 	router.Use(middleware.Cors())              //配置自定义的cors跨域中间件
 	initV1Route(router, serverCtx)             //加载业务api路由
+	pprof.Register(router)                     // 注册pprof路由
 	return router
 }
